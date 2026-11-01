@@ -333,7 +333,7 @@ python3 -m unittest discover -s pg-course/tests -p test_configure.py -v
 
 ## Документация компонентов
 
-- [PostgreSQL: руководство](https://www.postgresql.org/docs/18/).
+- [PostgreSQL: руководство](https://postgrespro.ru/docs/postgresql/18/).
 - [Patroni: конфигурация](https://patroni.readthedocs.io/en/latest/yaml_configuration.html) и [режимы репликации](https://patroni.readthedocs.io/en/latest/replication_modes.html).
 - [pgBackRest: руководство](https://pgbackrest.org/user-guide.html).
 - [PgBouncer: режимы работы](https://www.pgbouncer.org/features.html).
