@@ -1,4 +1,4 @@
--- Небольшой пример секционирования с ограниченным числом строк.
+-- Пример секционирования по месяцу события.
 CREATE TABLE IF NOT EXISTS lab.events (
   event_id bigint NOT NULL, created_at date NOT NULL, payload text NOT NULL,
   PRIMARY KEY(event_id,created_at)

@@ -1,4 +1,4 @@
--- Проверка назначенных прав без изменения ролей.
+-- Назначенные права ролей, TLS и правила HBA.
 SELECT rolname,rolsuper,rolcanlogin FROM pg_roles
 WHERE rolname IN ('course_owner','course_app','course_reader','course_migrator','course_monitor');
 SELECT role,has_table_privilege(role,'sales.orders','SELECT') AS can_read,

@@ -1,4 +1,4 @@
--- Сначала измеряем запрос без индекса customer_id.
+-- План запроса до создания индекса по customer_id.
 EXPLAIN (ANALYZE,BUFFERS)
 SELECT order_id,created_at,status,amount FROM sales.orders
 WHERE customer_id=42 ORDER BY created_at DESC LIMIT 20;

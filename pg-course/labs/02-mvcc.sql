@@ -1,4 +1,4 @@
--- Выполняйте блоки вручную в двух SQL-сеансах, не запускайте файл целиком.
+-- SQL-блоки для двух сеансов: А удерживает снимок, Б изменяет строку и запускает VACUUM.
 -- Сеанс А: удерживаем снимок и сравниваем видимость данных.
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 SELECT order_id,status FROM sales.orders WHERE order_id=1;

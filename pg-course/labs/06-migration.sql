@@ -1,7 +1,7 @@
--- Не оборачивайте файл в общую транзакцию: CREATE INDEX CONCURRENTLY требует отдельной команды.
+-- CREATE INDEX CONCURRENTLY выполняется отдельной командой вне блока BEGIN/COMMIT.
 SET lock_timeout='3s';
 ALTER TABLE sales.orders ADD COLUMN IF NOT EXISTS delivery_note text;
--- Одна небольшая порция заполнения вместо обновления всей таблицы.
+-- Порция заполнения на 1000 строк.
 WITH batch AS (
   SELECT order_id FROM sales.orders WHERE delivery_note IS NULL ORDER BY order_id LIMIT 1000
 )
