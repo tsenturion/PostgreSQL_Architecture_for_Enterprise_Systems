@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# Управление только выделенным учебным проектом pgcourse.
+set -Eeuo pipefail
+umask 077
+[[ $EUID == 0 ]] || { echo 'Запустите labctl от root.' >&2; exit 1; }
+LAB_HOME=${LAB_HOME:-$(cat /etc/pg-course-home)}
+[[ -f $LAB_HOME/.pg-course-installation && -f $LAB_HOME/.env ]] || { echo 'Не найдена установка стенда.' >&2; exit 1; }
+cd "$LAB_HOME"
+set -a
+. ./.env
+set +a
+PG_MAJOR=$(python3 -c 'import json; print(json.load(open("versions.json"))["postgres_major"])')
+PG_DATA_SUFFIX="$PG_MAJOR/docker"
+action=${1:-help}
+(($# == 0)) || shift
+install -d -m 0700 logs/commands state
+printf '%s Команда: %s\n' "$(date -u +%FT%TZ)" "$action" >> "logs/commands/$(date -u +%F).log"
+trap 'rc=$?; printf "%s Ошибка команды %s: строка %s, код %s\n" "$(date -u +%FT%TZ)" "$action" "$LINENO" "$rc" >> "logs/commands/$(date -u +%F).log"; exit "$rc"' ERR
+
+dc() { docker compose --project-directory "$LAB_HOME" -f "$LAB_HOME/compose.json" "$@"; }
+tool() { dc run --rm --no-deps -T tools tool "$@"; }
+health() { tool python3 /course-scripts/health.py "$@"; }
+leader() { health leader; }
+exclusive() { exec 8>"$LAB_HOME/state/action.lock"; flock -n 8 || { echo 'Другая операция с данными уже выполняется.' >&2; exit 1; }; }
+valid_service() {
+  case "${1:-}" in pg1|pg2|etcd1|etcd2|etcd3|rw|pool) ;;
+    *) echo 'Допустимы pg1, pg2, etcd1, etcd2, etcd3, rw, pool.' >&2; exit 2 ;;
+  esac
+}
+backup() {
+  local node
+  node=$(leader)
+  dc exec -T -u postgres "$node" pgbackrest --stanza=course --type=full backup
+}
+help() {
+  cat <<'EOF'
+labctl status                  Состояние контейнеров и роли PostgreSQL
+labctl check                   Проверить репликацию, TLS, роли и маршрутизацию
+labctl sql [аргументы psql]     SQL на текущем primary через HAProxy
+labctl sql-node pg1|pg2         SQL непосредственно на выбранном экземпляре
+labctl pool-sql                Консоль SHOW POOLS/SHOW STATS PgBouncer
+labctl logs СЕРВИС [ЧИСЛО]      Последние строки журнала
+labctl diagnose                Сохранить диагностический отчёт без паролей
+labctl up | down               Запустить/остановить стенд с сохранением данных
+labctl stop СЕРВИС             Остановить компонент для учебного эксперимента
+labctl start СЕРВИС            Вернуть компонент после эксперимента
+labctl switchover              Планово переключить primary и replica
+labctl sync off|on|strict      Асинхронный, синхронный или строгий режим Patroni
+labctl workload [СЕКУНДЫ]      Ограниченная нагрузка: 4 клиента, 50 транзакций/с
+labctl observe [СЕКУНДЫ]       Запись операций с журналом подтверждений COMMIT
+labctl backup                  Полная резервная копия с хранением двух копий
+labctl backup-info             Информация о копиях
+labctl restore [--time ВРЕМЯ]  Восстановить отдельный экземпляр; исходные базы сохраняются
+labctl restore-sql             SQL на восстановленном экземпляре
+labctl restore-clean --confirm Удалить ТОЛЬКО данные предыдущего учебного восстановления
+labctl monitoring on|off       Включить/остановить Prometheus, Grafana и экспортёры
+labctl versions                Планируемые и фактически установленные версии компонентов
+labctl credentials             Показать сохранённые пароли
+labctl housekeeping            Выполнить ротацию журналов
+EOF
+}
+
+case "$action" in
+  help|-h|--help) help ;;
+  wait-primary|wait-replica) health "$action" ;;
+  check) health check ;;
+  seed) exclusive; tool python3 /course-scripts/seed.py ;;
+  status)
+    dc --profile monitoring --profile restore ps -a
+    if node=$(leader); then
+      dc exec -T -u postgres "$node" patronictl -c /etc/course/patroni.json list
+    fi
+    ;;
+  sql)
+    if [[ -t 0 && $# == 0 ]]; then dc run --rm --no-deps tools tool psql -X -v ON_ERROR_STOP=1
+    else tool psql -X -v ON_ERROR_STOP=1 "$@"; fi
+    ;;
+  sql-node)
+    node=${1:?Укажите pg1 или pg2}; shift
+    [[ $node == pg1 || $node == pg2 ]] || { echo 'Укажите pg1 или pg2.' >&2; exit 2; }
+    tool env PGHOST="$node" psql -X -v ON_ERROR_STOP=1 "$@"
+    ;;
+  pool-sql) tool env PGHOST=pool PGPORT=6432 PGDATABASE=pgbouncer psql -X -v ON_ERROR_STOP=1 "$@" ;;
+  up)
+    exclusive
+    dc up -d etcd1 etcd2 etcd3 pg1 pg2 rw pool
+    health wait-primary
+    health wait-replica
+    ;;
+  down) exclusive; dc --profile monitoring --profile restore down ;;
+  stop|start)
+    valid_service "${1:-}"
+    if [[ $action == start ]]; then dc up -d --no-deps "$1"; else dc stop -t 10 "$1"; fi
+    ;;
+  switchover)
+    node=$(leader)
+    if [[ $node == pg1 ]]; then candidate=pg2; else candidate=pg1; fi
+    dc exec -T -u postgres "$node" patronictl -c /etc/course/patroni.json switchover \
+      --leader "$node" --candidate "$candidate" --force
+    health wait-primary
+    ;;
+  sync)
+    case ${1:-} in
+      off) mode=false; strict=false ;;
+      on) mode=true; strict=false ;;
+      strict) mode=true; strict=true ;;
+      *) echo 'Укажите off, on или strict.' >&2; exit 2 ;;
+    esac
+    node=$(leader)
+    tool curl --fail --silent --show-error -u "admin:$PATRONI_API_PASSWORD" \
+      -XPATCH -H 'Content-Type: application/json' \
+      -d "{\"synchronous_mode\":$mode,\"synchronous_mode_strict\":$strict,\"synchronous_node_count\":1}" \
+      "http://$node:8008/config"
+    printf '\n'
+    ;;
+  workload)
+    seconds=${1:-20}
+    [[ $seconds =~ ^[0-9]+$ ]] && ((seconds >= 1 && seconds <= 120)) || { echo 'Допустимо 1–120 секунд.' >&2; exit 2; }
+    tool env PGHOST=pool PGPORT=6432 PGUSER=course_app PGPASSWORD="$APP_PASSWORD" \
+      pgbench -n -c 4 -j 2 -T "$seconds" -R 50 -P 5 -D orders="$ORDERS" -f /labs/workload.sql course
+    ;;
+  observe)
+    seconds=${1:-30}
+    [[ $seconds =~ ^[0-9]+$ ]] && ((seconds >= 1 && seconds <= 120)) || { echo 'Допустимо 1–120 секунд.' >&2; exit 2; }
+    tool python3 /course-scripts/observe.py "$seconds" | tee "logs/commands/observe-$(date -u +%Y%m%dT%H%M%S).log"
+    ;;
+  backup-init)
+    exclusive
+    node=$(leader)
+    dc exec -T -u postgres "$node" pgbackrest --stanza=course stanza-create
+    dc exec -T -u postgres "$node" pgbackrest --stanza=course check
+    if dc exec -T -u postgres "$node" pgbackrest --stanza=course --output=json --log-level-console=off info |
+        python3 -c 'import json,sys; x=json.load(sys.stdin); sys.exit(0 if x and x[0].get("backup") else 1)'; then
+      echo 'Резервная копия уже есть; повторная установка новую копию не создаёт.'
+    else backup; fi
+    ;;
+  backup) exclusive; backup ;;
+  backup-info)
+    node=$(leader); dc exec -T -u postgres "$node" pgbackrest --stanza=course info
+    ;;
+  restore)
+    exclusive
+    [[ ! -f data/restore/$PG_DATA_SUFFIX/PG_VERSION ]] || { echo 'Отдельный экземпляр уже восстановлен. Для нового опыта: labctl restore-clean --confirm' >&2; exit 1; }
+    [[ -z $(find data/restore -mindepth 1 -maxdepth 1 -print -quit) ]] || {
+      echo 'Каталог восстановления не пуст. Сначала разберите результат предыдущей попытки.' >&2; exit 1;
+    }
+    node=$(leader)
+    args=(--stanza=course "--pg1-path=/restore/$PG_DATA_SUFFIX" --archive-mode=off
+      '--recovery-option=restore_command=pgbackrest --stanza=course archive-get %f "%p"')
+    if (($#)); then
+      [[ $# == 2 && $1 == --time ]] || { echo 'Формат: labctl restore [--time "2026-11-02 12:34:56+00"]' >&2; exit 2; }
+      args+=(--type=time "--target=$2" --target-action=promote)
+    else args+=(--type=default); fi
+    dc exec -T -u postgres "$node" pgbackrest "${args[@]}" restore
+    dc --profile restore up -d --no-deps restore
+    health wait-restore
+    echo 'Отдельный восстановленный экземпляр готов: labctl restore-sql'
+    ;;
+  restore-sql) tool env PGHOST=restore psql -X -v ON_ERROR_STOP=1 "$@" ;;
+  restore-clean)
+    exclusive
+    [[ ${1:-} == --confirm && $# == 1 ]] || { echo 'Для удаления только учебного восстановления укажите --confirm.' >&2; exit 2; }
+    target=$(realpath -- "$LAB_HOME/data/restore")
+    [[ $target == "$LAB_HOME/data/restore" && ! -L $LAB_HOME/data/restore ]] || { echo 'Небезопасный путь восстановления.' >&2; exit 1; }
+    dc --profile restore stop restore
+    find "$target" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    echo 'Удалены только данные отдельного восстановления; pg1, pg2 и копии сохранены.'
+    ;;
+  monitoring)
+    case ${1:-} in
+      on) dc --profile monitoring up -d exporter1 exporter2 prometheus grafana ;;
+      off) dc --profile monitoring stop exporter1 exporter2 prometheus grafana ;;
+      *) echo 'Укажите on или off.' >&2; exit 2 ;;
+    esac
+    ;;
+  versions)
+    cat versions.json
+    printf '\nФактически установлено в служебном образе:\n'
+    tool python3 /course-scripts/versions.py
+    dc exec -T rw haproxy -v
+    ;;
+  logs)
+    service=${1:?Укажите сервис}; lines=${2:-100}
+    case $service in pg1|pg2|restore|etcd1|etcd2|etcd3|rw|pool|exporter1|exporter2|prometheus|grafana) ;;
+      *) echo 'Неизвестный сервис.' >&2; exit 2 ;; esac
+    [[ $lines =~ ^[0-9]+$ ]] && ((lines >= 1 && lines <= 10000)) || exit 2
+    tail -n "$lines" "logs/$service/service.log"
+    ;;
+  diagnose)
+    report="logs/commands/diagnose-$(date -u +%Y%m%dT%H%M%S).log"
+    { date -u; dc --profile monitoring --profile restore ps -a; free -m; df -h "$LAB_HOME" /var/lib/docker;
+      health check || true
+      for service in pg1 pg2 etcd1 etcd2 etcd3 rw pool; do
+        printf '\nЖурнал %s\n' "$service"
+        tail -n 80 "logs/$service/service.log" 2>/dev/null || true
+      done
+    } > "$report" 2>&1
+    printf 'Отчёт: %s/%s\n' "$LAB_HOME" "$report"
+    ;;
+  credentials)
+    printf 'Адрес публикации: %s\nБаза: course\n' "$BIND_ADDRESS"
+    printf 'postgres: %s\ncourse_app: %s\ncourse_reader: %s\ncourse_migrator: %s\ncourse_monitor: %s\nGrafana admin: %s\n' \
+      "$POSTGRES_PASSWORD" "$APP_PASSWORD" "$READER_PASSWORD" "$MIGRATOR_PASSWORD" "$MONITOR_PASSWORD" "$GRAFANA_PASSWORD"
+    ;;
+  housekeeping)
+    logrotate --force --state "$LAB_HOME/state/logrotate.status" /etc/pg-course-logrotate
+    find "$LAB_HOME/logs/install" "$LAB_HOME/logs/commands" -type f -name '*.log' -mtime +7 -delete
+    ;;
+  *) help >&2; exit 2 ;;
+esac
