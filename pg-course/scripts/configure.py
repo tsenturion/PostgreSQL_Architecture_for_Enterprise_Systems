@@ -327,7 +327,7 @@ log_disconnections = 1
     services["grafana"] = {
         "image": VERSIONS["grafana_image"], "profiles": ["monitoring"], "restart": "unless-stopped",
         "stop_grace_period": "30s",
-        "user": "472:472", "mem_limit": "256m", "cpus": 0.4, "logging": logs, "networks": ["course"],
+        "user": "472:472", "mem_limit": "384m", "memswap_limit": "512m", "cpus": 0.4, "logging": logs, "networks": ["course"],
         "ports": ["${BIND_ADDRESS}:3000:3000"],
         "environment": {"GF_SECURITY_ADMIN_USER": "admin", "GF_SECURITY_ADMIN_PASSWORD": "${GRAFANA_PASSWORD}",
                         "GF_USERS_ALLOW_SIGN_UP": "false", "GF_ANALYTICS_REPORTING_ENABLED": "false",

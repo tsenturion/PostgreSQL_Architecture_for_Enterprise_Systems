@@ -64,6 +64,8 @@ class ConfigureTests(unittest.TestCase):
         for name in ("prometheus", "grafana", "exporter1", "exporter2"):
             self.assertEqual(services[name]["profiles"], ["monitoring"])
         self.assertEqual(services["restore"]["profiles"], ["restore"])
+        self.assertEqual(services["grafana"]["mem_limit"], "384m")
+        self.assertEqual(services["grafana"]["memswap_limit"], "512m")
         self.assertNotIn("upgrade", services)
         for name in ("pg1", "pg2"):
             self.assertIn("./data/restore:/restore", services[name]["volumes"])
