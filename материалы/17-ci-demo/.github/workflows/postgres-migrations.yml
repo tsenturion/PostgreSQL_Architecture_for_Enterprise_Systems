@@ -1,0 +1,81 @@
+name: Проверка миграций PostgreSQL
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    container: postgres:18.6-trixie
+    services:
+      postgres:
+        image: postgres:18.6-trixie
+        env:
+          POSTGRES_DB: delivery
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-demo-only
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d delivery"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      PGHOST: postgres
+      PGPORT: '5432'
+      PGDATABASE: delivery
+      PGUSER: postgres
+      PGPASSWORD: ci-demo-only
+      PGCONNECT_TIMEOUT: '5'
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - name: Проверить обновление с версии 1 и чистую установку
+        shell: bash
+        run: |
+          release="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          bash db/test-upgrade.sh "$release"
+          psql -X -w -v ON_ERROR_STOP=1 -c 'CREATE DATABASE delivery_clean'
+          PGDATABASE=delivery_clean bash db/migrate.sh 2 "$release"
+          PGDATABASE=delivery_clean psql -X -w -v ON_ERROR_STOP=1 -c '
+            DO $$ BEGIN
+              IF (SELECT count(*) FROM delivery17.schema_history) <> 2 THEN
+                RAISE EXCEPTION $msg$История чистой установки неполна$msg$;
+              END IF;
+              PERFORM delivery_channel FROM delivery17.orders;
+            END $$;'
+          printf 'Версия схемы 2 проверена на обновлении и чистой установке. Ревизия: `%s`.\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-staging:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.private && github.ref == 'refs/heads/main' && vars.ENABLE_STAGING_DEPLOY == 'true' }}
+    needs: upgrade
+    runs-on: [self-hosted, linux, pg-staging17]
+    timeout-minutes: 5
+    environment: staging
+    concurrency:
+      group: pg-staging17
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - name: Применить проверенную ревизию к staging
+        shell: bash
+        env:
+          PGHOST: ${{ vars.STAGING_PGHOST }}
+          PGPORT: '5432'
+          PGDATABASE: ${{ vars.STAGING_PGDATABASE }}
+          PGUSER: ${{ vars.STAGING_PGUSER }}
+          PGPASSWORD: ${{ secrets.STAGING_PGPASSWORD }}
+          PGSSLROOTCERT: ${{ vars.STAGING_PGSSLROOTCERT }}
+          PGSSLMODE: verify-full
+        run: |
+          : "${PGHOST:?}" "${PGDATABASE:?}" "${PGUSER:?}" "${PGPASSWORD:?}" "${PGSSLROOTCERT:?}"
+          test -r "$PGSSLROOTCERT"
+          bash db/migrate.sh 2 "$GITHUB_SHA"
+          psql -X -w -v ON_ERROR_STOP=1 -c 'SELECT order_id, delivery_channel FROM delivery17.orders LIMIT 0;'
+          printf 'Схема 2 доступна в staging. Ревизия: `%s`.\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,97 @@
+---
+- name: Применить стандарт базы приложения
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  module_defaults:
+    group/community.postgresql.all:
+      login_host: "{{ platform.host }}"
+      login_port: "{{ platform.port }}"
+      login_user: postgres
+      login_password: "{{ lookup('ansible.builtin.file', playbook_dir + '/../.secrets/admin') }}"
+      connect_params:
+        connect_timeout: 3
+        application_name: platform18-ansible
+  tasks:
+    - name: Проверить назначение и форму контракта
+      ansible.builtin.assert:
+        that:
+          - platform.host == '127.0.0.1'
+          - platform.port | int == 15435
+          - platform.database is match('^svc_[a-z][a-z0-9_]{1,19}$')
+          - platform.owner == platform.database ~ '_owner'
+          - platform.login == platform.database ~ '_app'
+          - platform.schema == 'app'
+          - platform.statement_timeout in ['2s', '4s']
+
+    - name: Дождаться готовности PostgreSQL на учебном порту
+      ansible.builtin.wait_for:
+        host: "{{ platform.host }}"
+        port: "{{ platform.port }}"
+        timeout: 60
+
+    - name: Проверить вход администратора в PostgreSQL
+      community.postgresql.postgresql_ping:
+        login_db: postgres
+      register: database_ping
+      until: database_ping.is_available | default(false)
+      retries: 15
+      delay: 2
+
+    - name: Создать владельца без входа
+      community.postgresql.postgresql_user:
+        login_db: postgres
+        name: "{{ platform.owner }}"
+        role_attr_flags: NOLOGIN,NOSUPERUSER,NOCREATEDB,NOCREATEROLE,NOREPLICATION,NOBYPASSRLS
+        state: present
+
+    - name: Создать базу команды
+      community.postgresql.postgresql_db:
+        name: "{{ platform.database }}"
+        owner: "{{ platform.owner }}"
+        state: present
+
+    - name: Создать роль приложения с таймаутом профиля
+      community.postgresql.postgresql_user:
+        login_db: postgres
+        name: "{{ platform.login }}"
+        password: "{{ lookup('ansible.builtin.file', playbook_dir + '/../.secrets/app') }}"
+        role_attr_flags: LOGIN,NOSUPERUSER,NOCREATEDB,NOCREATEROLE,NOREPLICATION,NOBYPASSRLS
+        configuration:
+          statement_timeout: "{{ platform.statement_timeout }}"
+        state: present
+      no_log: true
+
+    - name: Создать схему с отдельным владельцем
+      community.postgresql.postgresql_schema:
+        login_db: "{{ platform.database }}"
+        name: "{{ platform.schema }}"
+        owner: "{{ platform.owner }}"
+        state: present
+
+    - name: Отозвать общие права входа и временных объектов
+      community.postgresql.postgresql_privs:
+        login_db: "{{ platform.database }}"
+        type: database
+        privs: CONNECT,TEMPORARY
+        roles: PUBLIC
+        state: absent
+
+    - name: Выдать приложению право подключаться к базе
+      community.postgresql.postgresql_privs:
+        login_db: "{{ platform.database }}"
+        type: database
+        privs: CONNECT
+        roles: "{{ platform.login }}"
+        state: present
+
+    - name: Выдать приложению право использовать схему
+      community.postgresql.postgresql_privs:
+        login_db: "{{ platform.database }}"
+        type: schema
+        objs: "{{ platform.schema }}"
+        privs: USAGE
+        roles: "{{ platform.login }}"
+        state: present
